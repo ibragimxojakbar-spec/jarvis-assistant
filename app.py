@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL ="gemini-2.5-flash"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 GEMINI_API = (
