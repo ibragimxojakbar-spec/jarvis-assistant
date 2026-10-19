@@ -178,7 +178,34 @@ def telegram_webhook():
     return jsonify({"ok": True})
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
+@app.route("/check-models")
+def check_models():
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "API key missing"}), 500
+
+    response = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers={"x-goog-api-key": GEMINI_API_KEY},
+        timeout=20
+    )
+
+    if not response.ok:
+        return jsonify({
+            "error": response.status_code,
+            "details": response.text[:500]
+        }), response.status_code
+
+    data = response.json()
+    models = [
+        model["name"]
+        for model in data.get("models", [])
+        if "generateContent" in
+        model.get("supportedGenerationMethods", [])
+    ]
+
+    return jsonify({"models": models})
+
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
