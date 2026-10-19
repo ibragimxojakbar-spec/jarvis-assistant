@@ -31,6 +31,46 @@ def health():
     return jsonify({"status": "healthy"})
 
 
+# Check which Gemini models support generateContent.
+@app.route("/check-models")
+def check_models():
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "API key missing"}), 500
+
+    try:
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=20
+        )
+
+        if not response.ok:
+            app.logger.error(
+                "List models failed: HTTP %s: %s",
+                response.status_code,
+                response.text[:500]
+            )
+            return jsonify({
+                "error": response.status_code,
+                "details": response.text[:500]
+            }), response.status_code
+
+        data = response.json()
+
+        models = [
+            model["name"]
+            for model in data.get("models", [])
+            if "generateContent" in
+            model.get("supportedGenerationMethods", [])
+        ]
+
+        return jsonify({"models": models})
+
+    except requests.RequestException:
+        app.logger.exception("Could not retrieve Gemini models")
+        return jsonify({"error": "Request failed"}), 502
+
+
 def ask_gemini(user_text):
     payload = {
         "system_instruction": {
@@ -55,7 +95,6 @@ def ask_gemini(user_text):
         "Content-Type": "application/json"
     }
 
-    # Retry temporary Gemini errors up to 3 times.
     for attempt in range(3):
         try:
             response = requests.post(
@@ -65,7 +104,9 @@ def ask_gemini(user_text):
                 timeout=20
             )
 
-            if response.status_code in (429, 500, 502, 503, 504):
+            if response.status_code in (
+                429, 500, 502, 503, 504
+            ):
                 app.logger.warning(
                     "Gemini temporary error: HTTP %s, attempt %s/3",
                     response.status_code,
@@ -80,13 +121,17 @@ def ask_gemini(user_text):
             data = response.json()
 
             candidates = data.get("candidates", [])
+
             if not candidates:
                 raise ValueError(
                     "Gemini returned no candidates: "
                     + str(data.get("promptFeedback", {}))
                 )
 
-            parts = candidates[0].get("content", {}).get("parts", [])
+            parts = candidates[0].get(
+                "content", {}
+            ).get("parts", [])
+
             answer = "".join(
                 part.get("text", "") for part in parts
             ).strip()
@@ -96,14 +141,19 @@ def ask_gemini(user_text):
 
             return answer
 
-        except (requests.Timeout, requests.ConnectionError):
+        except (
+            requests.Timeout,
+            requests.ConnectionError
+        ):
             app.logger.warning(
                 "Gemini connection issue, attempt %s/3",
                 attempt + 1
             )
+
             if attempt < 2:
                 time.sleep(1 + attempt * 2)
                 continue
+
             raise
 
     raise RuntimeError("Gemini failed after retries")
@@ -125,18 +175,29 @@ def send_message(chat_id, text):
 @app.route("/set-webhook")
 def set_webhook():
     if not TOKEN:
-        return jsonify({"error": "Telegram token is missing"}), 500
+        return jsonify({
+            "error": "Telegram token is missing"
+        }), 500
 
     url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url:
-        return jsonify({"error": "Render URL not found"}), 500
 
-    response = requests.post(
-        f"{TELEGRAM_API}/setWebhook",
-        json={"url": f"{url}/telegram-webhook"},
-        timeout=15
-    )
-    return jsonify(response.json()), response.status_code
+    if not url:
+        return jsonify({
+            "error": "Render URL not found"
+        }), 500
+
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/setWebhook",
+            json={"url": f"{url}/telegram-webhook"},
+            timeout=15
+        )
+
+        return jsonify(response.json()), response.status_code
+
+    except requests.RequestException:
+        app.logger.exception("Failed to set Telegram webhook")
+        return jsonify({"error": "Webhook request failed"}), 502
 
 
 @app.route("/telegram-webhook", methods=["POST"])
@@ -153,19 +214,25 @@ def telegram_webhook():
     if user_text == "/start":
         send_message(
             chat_id,
-            "Hello! I'm Jarvis, connected to Gemini AI. Ask me anything!"
+            "Hello! I'm Jarvis, connected to Gemini AI. "
+            "Ask me anything!"
         )
         return jsonify({"ok": True})
 
     if not GEMINI_API_KEY:
-        send_message(chat_id, "Gemini API key is not configured.")
+        send_message(
+            chat_id,
+            "Gemini API key is not configured."
+        )
         return jsonify({"ok": True})
 
     try:
         answer = ask_gemini(user_text)
         send_message(chat_id, answer)
+
     except Exception:
         app.logger.exception("Jarvis AI request failed")
+
         try:
             send_message(
                 chat_id,
@@ -173,39 +240,14 @@ def telegram_webhook():
                 "Please try again in a minute."
             )
         except Exception:
-            app.logger.exception("Failed to send Telegram error message")
+            app.logger.exception(
+                "Failed to send Telegram error message"
+            )
 
     return jsonify({"ok": True})
 
 
-if __name__ == "__main__": 
-@app.route("/check-models")
-def check_models():
-    if not GEMINI_API_KEY:
-        return jsonify({"error": "API key missing"}), 500
-
-    response = requests.get(
-        "https://generativelanguage.googleapis.com/v1beta/models",
-        headers={"x-goog-api-key": GEMINI_API_KEY},
-        timeout=20
-    )
-
-    if not response.ok:
-        return jsonify({
-            "error": response.status_code,
-            "details": response.text[:500]
-        }), response.status_code
-
-    data = response.json()
-    models = [
-        model["name"]
-        for model in data.get("models", [])
-        if "generateContent" in
-        model.get("supportedGenerationMethods", [])
-    ]
-
-    return jsonify({"models": models})
-
+if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
