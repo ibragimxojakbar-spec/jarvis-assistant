@@ -1,5 +1,6 @@
 
 import os
+import time
 import requests
 from flask import Flask, jsonify, request
 
@@ -31,48 +32,94 @@ def health():
 
 
 def ask_gemini(user_text):
-    response = requests.post(
-        GEMINI_API,
-        headers={
-            "x-goog-api-key": GEMINI_API_KEY,
-            "Content-Type": "application/json"
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You are Jarvis, a helpful personal AI assistant. "
+                    "Be friendly, clear, and practical. "
+                    "Help with web development, business, and daily tasks."
+                )
+            }]
         },
-        json={
-            "system_instruction": {
-                "parts": [{
-                    "text": (
-                        "You are Jarvis, a helpful personal AI assistant. "
-                        "Be friendly, clear, and practical. "
-                        "Help with web development, business, and daily tasks."
-                    )
-                }]
-            },
-            "contents": [{
-                "parts": [{"text": user_text}]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": 700
-            }
-        },
-        timeout=40
-    )
-    response.raise_for_status()
-    data = response.json()
+        "contents": [{
+            "parts": [{"text": user_text}]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 700
+        }
+    }
 
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    # Retry temporary Gemini errors up to 3 times.
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                GEMINI_API,
+                headers=headers,
+                json=payload,
+                timeout=20
+            )
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                app.logger.warning(
+                    "Gemini temporary error: HTTP %s, attempt %s/3",
+                    response.status_code,
+                    attempt + 1
+                )
+
+                if attempt < 2:
+                    time.sleep(1 + attempt * 2)
+                    continue
+
+            response.raise_for_status()
+            data = response.json()
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise ValueError(
+                    "Gemini returned no candidates: "
+                    + str(data.get("promptFeedback", {}))
+                )
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer = "".join(
+                part.get("text", "") for part in parts
+            ).strip()
+
+            if not answer:
+                raise ValueError("Gemini returned an empty answer")
+
+            return answer
+
+        except (requests.Timeout, requests.ConnectionError):
+            app.logger.warning(
+                "Gemini connection issue, attempt %s/3",
+                attempt + 1
+            )
+            if attempt < 2:
+                time.sleep(1 + attempt * 2)
+                continue
+            raise
+
+    raise RuntimeError("Gemini failed after retries")
 
 
 def send_message(chat_id, text):
-    # Telegram message limit is 4096 characters.
     for start in range(0, len(text), 4000):
-        requests.post(
+        response = requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": text[start:start + 4000]
             },
             timeout=15
-        ).raise_for_status()
+        )
+        response.raise_for_status()
 
 
 @app.route("/set-webhook")
@@ -89,7 +136,7 @@ def set_webhook():
         json={"url": f"{url}/telegram-webhook"},
         timeout=15
     )
-    return jsonify(response.json())
+    return jsonify(response.json()), response.status_code
 
 
 @app.route("/telegram-webhook", methods=["POST"])
@@ -98,7 +145,7 @@ def telegram_webhook():
     message = update.get("message", {})
     chat = message.get("chat", {})
     chat_id = chat.get("id")
-    user_text = message.get("text", "").strip()
+    user_text = (message.get("text") or "").strip()
 
     if not chat_id or not user_text:
         return jsonify({"ok": True})
@@ -106,8 +153,7 @@ def telegram_webhook():
     if user_text == "/start":
         send_message(
             chat_id,
-            "Hello! I'm Jarvis, now connected to Gemini AI. "
-            "Ask me anything!"
+            "Hello! I'm Jarvis, connected to Gemini AI. Ask me anything!"
         )
         return jsonify({"ok": True})
 
@@ -119,12 +165,15 @@ def telegram_webhook():
         answer = ask_gemini(user_text)
         send_message(chat_id, answer)
     except Exception:
-        app.logger.exception("Gemini request failed")
-        send_message(
-            chat_id,
-            "Sorry, I couldn't get an AI response. "
-            "Please try again shortly."
-        )
+        app.logger.exception("Jarvis AI request failed")
+        try:
+            send_message(
+                chat_id,
+                "Jarvis is temporarily unable to get an AI response. "
+                "Please try again in a minute."
+            )
+        except Exception:
+            app.logger.exception("Failed to send Telegram error message")
 
     return jsonify({"ok": True})
 
