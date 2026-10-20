@@ -112,6 +112,33 @@ def get_recent_memory(owner_id, limit=10):
         return []
 
 
+
+def claim_telegram_update(update_id):
+    try:
+        response = requests.post(
+            UPDATES_URL,
+            headers={
+                **memory_headers(),
+                "Prefer": "resolution=ignore-duplicates,return=representation",
+            },
+            params={"on_conflict": "update_id"},
+            json={"update_id": int(update_id)},
+            timeout=10,
+        )
+
+        if response.status_code not in (200, 201, 204):
+            app.logger.error(
+                "Telegram update claim failed: HTTP %s",
+                response.status_code,
+            )
+            return None
+
+        rows = response.json() if response.content else []
+        return bool(rows)
+
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Telegram update claim failed")
+        return None
 def save_memory(owner_id, memory_type, content):
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         app.logger.warning("Supabase memory is not configured")
@@ -408,7 +435,8 @@ def set_webhook():
         }), 502
 
 
-# Telegram webhook: validate secret and allow owner only
+
+# Telegram webhook: validate secret, allow owner only, prevent duplicates
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     supplied_secret = request.headers.get(
@@ -428,6 +456,11 @@ def telegram_webhook():
         return jsonify({"error": "Unauthorized"}), 401
 
     update = request.get_json(silent=True) or {}
+    update_id = update.get("update_id")
+
+    if update_id is None:
+        return jsonify({"error": "Missing update_id"}), 400
+
     message = update.get("message", {})
 
     if not message:
@@ -451,6 +484,16 @@ def telegram_webhook():
 
     if not chat_id or not user_text:
         return jsonify({"ok": True})
+
+    # Claim the update so Telegram retries aren't processed twice.
+    claimed = claim_telegram_update(update_id)
+
+    if claimed is False:
+        app.logger.info("Skipped duplicate Telegram update %s", update_id)
+        return jsonify({"ok": True})
+
+    if claimed is None:
+        return jsonify({"error": "Temporary processing error"}), 503
 
     command = user_text.strip().split()[0].split("@")[0]
 
