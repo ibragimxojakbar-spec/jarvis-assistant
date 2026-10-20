@@ -33,7 +33,7 @@ GEMINI_API = (
 )
 
 MEMORY_URL = f"{SUPABASE_URL}/rest/v1/jarvis_memory"
-
+UPDATES_URL = f"{SUPABASE_URL}/rest/v1/jarvis_telegram_updates"
 
 # Protect setup routes
 def require_setup_secret(view):
