@@ -15,6 +15,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
 SETUP_SECRET = os.environ.get("SETUP_SECRET", "").strip()
 
+TELEGRAM_WEBHOOK_SECRET = os.environ.get(
+    "TELEGRAM_WEBHOOK_SECRET", ""
+).strip()
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
     "SUPABASE_SERVICE_ROLE_KEY", ""
@@ -31,7 +35,7 @@ GEMINI_API = (
 MEMORY_URL = f"{SUPABASE_URL}/rest/v1/jarvis_memory"
 
 
-# Security for setup routes
+# Protect setup routes
 def require_setup_secret(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -40,7 +44,9 @@ def require_setup_secret(view):
         if (
             not SETUP_SECRET
             or not supplied
-            or not secrets.compare_digest(supplied, SETUP_SECRET)
+            or not secrets.compare_digest(
+                supplied, SETUP_SECRET
+            )
         ):
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -49,10 +55,13 @@ def require_setup_secret(view):
     return wrapped
 
 
-# Health
+# Health endpoints
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"service": "Jarvis Assistant", "status": "online"})
+    return jsonify({
+        "service": "Jarvis Assistant",
+        "status": "online"
+    })
 
 
 @app.route("/health", methods=["GET"])
@@ -71,6 +80,7 @@ def memory_headers():
 
 def get_recent_memory(owner_id, limit=10):
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        app.logger.warning("Supabase memory is not configured")
         return []
 
     try:
@@ -93,7 +103,6 @@ def get_recent_memory(owner_id, limit=10):
             )
             return []
 
-        # The database returns newest first; the AI needs oldest first.
         rows = response.json()
         rows.reverse()
         return rows
@@ -137,10 +146,13 @@ def save_memory(owner_id, memory_type, content):
         return False
 
 
-# Gemini
+# Gemini AI
 def ask_gemini(user_text, history=None):
     if not GEMINI_API_KEY:
-        return "Jarvis is not configured correctly. Please check server settings."
+        return (
+            "Jarvis is not configured correctly. "
+            "Please check server settings."
+        )
 
     contents = []
 
@@ -158,7 +170,6 @@ def ask_gemini(user_text, history=None):
         else:
             continue
 
-        # Gemini conversation history alternates user/model roles.
         if contents and contents[-1]["role"] == role:
             contents[-1]["parts"][0]["text"] += "\n" + content
         else:
@@ -167,9 +178,10 @@ def ask_gemini(user_text, history=None):
                 "parts": [{"text": content}],
             })
 
-    # Add the new message after the stored history.
     if contents and contents[-1]["role"] == "user":
-        contents[-1]["parts"][0]["text"] += "\n" + user_text.strip()
+        contents[-1]["parts"][0]["text"] += (
+            "\n" + user_text.strip()
+        )
     else:
         contents.append({
             "role": "user",
@@ -227,7 +239,9 @@ def ask_gemini(user_text, history=None):
                     if answer:
                         return answer
 
-                return "I received an empty response. Please try again."
+                return (
+                    "I received an empty response. Please try again."
+                )
 
             if response.status_code in retryable_statuses:
                 app.logger.warning(
@@ -235,25 +249,36 @@ def ask_gemini(user_text, history=None):
                     response.status_code,
                     attempt + 1,
                 )
+
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
 
-                return "Gemini is temporarily busy. Please try again shortly."
+                return (
+                    "Gemini is temporarily busy. "
+                    "Please try again shortly."
+                )
 
             app.logger.error(
                 "Gemini request failed: HTTP %s",
                 response.status_code,
             )
-            return "I couldn't process that request. Please try again later."
+            return (
+                "I couldn't process that request. "
+                "Please try again later."
+            )
 
         except (requests.RequestException, ValueError):
             app.logger.exception("Gemini request error")
+
             if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
 
-            return "I couldn't connect to Gemini. Please try again shortly."
+            return (
+                "I couldn't connect to Gemini. "
+                "Please try again shortly."
+            )
 
     return "Something went wrong. Please try again."
 
@@ -275,7 +300,10 @@ def send_message(chat_id, text):
         try:
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk},
+                json={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                },
                 timeout=20,
             )
 
@@ -298,7 +326,9 @@ def send_message(chat_id, text):
 @require_setup_secret
 def check_models():
     if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
+        return jsonify({
+            "error": "GEMINI_API_KEY is not configured"
+        }), 500
 
     try:
         response = requests.get(
@@ -308,18 +338,23 @@ def check_models():
         )
 
         if response.status_code != 200:
-            return jsonify({"error": "Gemini model lookup failed"}), 502
+            return jsonify({
+                "error": "Gemini model lookup failed"
+            }), 502
 
         models = [
             model["name"]
             for model in response.json().get("models", [])
             if model.get("name")
         ]
+
         return jsonify({"models": models})
 
     except (requests.RequestException, ValueError):
         app.logger.exception("Gemini model lookup error")
-        return jsonify({"error": "Could not check Gemini models"}), 502
+        return jsonify({
+            "error": "Could not check Gemini models"
+        }), 502
 
 
 # Configure Telegram webhook (protected)
@@ -331,12 +366,22 @@ def set_webhook():
     ).strip().rstrip("/")
 
     if not TOKEN or not render_url:
-        return jsonify({"error": "Bot token or Render URL is missing"}), 500
+        return jsonify({
+            "error": "Bot token or Render URL is missing"
+        }), 500
+
+    if not TELEGRAM_WEBHOOK_SECRET:
+        return jsonify({
+            "error": "TELEGRAM_WEBHOOK_SECRET is not configured"
+        }), 500
 
     try:
         response = requests.post(
             f"{TELEGRAM_API}/setWebhook",
-            json={"url": f"{render_url}/telegram-webhook"},
+            json={
+                "url": f"{render_url}/telegram-webhook",
+                "secret_token": TELEGRAM_WEBHOOK_SECRET,
+            },
             timeout=20,
         )
 
@@ -348,16 +393,40 @@ def set_webhook():
                 "message": "Webhook configured successfully",
             })
 
-        return jsonify({"error": "Telegram webhook setup failed"}), 502
+        app.logger.error(
+            "Telegram webhook setup failed: HTTP %s",
+            response.status_code,
+        )
+        return jsonify({
+            "error": "Telegram webhook setup failed"
+        }), 502
 
     except (requests.RequestException, ValueError):
         app.logger.exception("Webhook setup error")
-        return jsonify({"error": "Could not configure webhook"}), 502
+        return jsonify({
+            "error": "Could not configure webhook"
+        }), 502
 
 
-# Telegram webhook: owner-only private access
+# Telegram webhook: validate secret and allow owner only
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
+    supplied_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+
+    if (
+        not TELEGRAM_WEBHOOK_SECRET
+        or not supplied_secret
+        or not secrets.compare_digest(
+            supplied_secret, TELEGRAM_WEBHOOK_SECRET
+        )
+    ):
+        app.logger.warning(
+            "Rejected webhook request with invalid secret"
+        )
+        return jsonify({"error": "Unauthorized"}), 401
+
     update = request.get_json(silent=True) or {}
     message = update.get("message", {})
 
@@ -375,29 +444,32 @@ def telegram_webhook():
         or not OWNER_TELEGRAM_ID
         or user_id != OWNER_TELEGRAM_ID
     ):
-        app.logger.warning("Ignored unauthorized Telegram message")
+        app.logger.warning(
+            "Ignored unauthorized Telegram message"
+        )
         return jsonify({"ok": True})
 
     if not chat_id or not user_text:
         return jsonify({"ok": True})
 
-    if user_text.strip().split()[0].split("@")[0] == "/start":
+    command = user_text.strip().split()[0].split("@")[0]
+
+    if command == "/start":
         send_message(
             chat_id,
-            "Hello! I'm Jarvis, your personal AI assistant. How can I help?",
+            "Hello! I'm Jarvis, your personal AI assistant. "
+            "How can I help?",
         )
         return jsonify({"ok": True})
 
-    # Read earlier history before saving this new message.
     history = get_recent_memory(OWNER_TELEGRAM_ID, limit=10)
-
     answer = ask_gemini(user_text, history)
 
-    # Keep the bot responsive even if Supabase is temporarily unavailable.
     save_memory(OWNER_TELEGRAM_ID, "user", user_text.strip())
     save_memory(OWNER_TELEGRAM_ID, "assistant", answer)
 
     send_message(chat_id, answer)
+
     return jsonify({"ok": True})
 
 
