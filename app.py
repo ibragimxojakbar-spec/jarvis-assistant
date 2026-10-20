@@ -1,3 +1,4 @@
+
 import os
 import time
 import secrets
@@ -8,29 +9,29 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
-
+# Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-
 OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
 SETUP_SECRET = os.environ.get("SETUP_SECRET", "").strip()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_ROLE_KEY", ""
+).strip()
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
-
 GEMINI_API = (
     "https://generativelanguage.googleapis.com/v1beta/"
     f"models/{GEMINI_MODEL}:generateContent"
 )
 
-# ==================================================
-# SECURITY FOR SETUP ROUTES
-# ==================================================
+MEMORY_URL = f"{SUPABASE_URL}/rest/v1/jarvis_memory"
 
+
+# Security for setup routes
 def require_setup_secret(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -48,140 +49,167 @@ def require_setup_secret(view):
     return wrapped
 
 
-# ==================================================
-# HOME AND HEALTH
-# ==================================================
-
+# Health
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "service": "Jarvis Assistant",
-        "status": "online"
-    })
+    return jsonify({"service": "Jarvis Assistant", "status": "online"})
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "healthy"
-    })
+    return jsonify({"status": "healthy"})
 
 
-# ==================================================
-# CHECK AVAILABLE GEMINI MODELS
-# Requires X-Setup-Secret header
-# ==================================================
+# Supabase helpers
+def memory_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
 
-@app.route("/check-models", methods=["GET"])
-@require_setup_secret
-def check_models():
-    if not GEMINI_API_KEY:
-        return jsonify({
-            "error": "GEMINI_API_KEY is not configured"
-        }), 500
 
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        "v1beta/models"
-    )
+def get_recent_memory(owner_id, limit=10):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return []
 
     try:
         response = requests.get(
-            url,
-            headers={
-                "x-goog-api-key": GEMINI_API_KEY
+            MEMORY_URL,
+            headers=memory_headers(),
+            params={
+                "select": "memory_type,content,created_at",
+                "owner_telegram_id": f"eq.{owner_id}",
+                "order": "created_at.desc",
+                "limit": limit,
             },
-            timeout=20
+            timeout=15,
         )
 
-        try:
-            data = response.json()
-        except ValueError:
-            data = {"error": "Invalid response from Gemini"}
-
         if response.status_code != 200:
-            return jsonify({
-                "error": "Gemini model lookup failed",
-                "status_code": response.status_code
-            }), 502
+            app.logger.error(
+                "Supabase memory read failed: HTTP %s",
+                response.status_code,
+            )
+            return []
 
-        models = [
-            model.get("name")
-            for model in data.get("models", [])
-            if model.get("name")
-        ]
+        # The database returns newest first; the AI needs oldest first.
+        rows = response.json()
+        rows.reverse()
+        return rows
 
-        return jsonify({
-            "models": models
-        })
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Could not read Jarvis memory")
+        return []
+
+
+def save_memory(owner_id, memory_type, content):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        app.logger.warning("Supabase memory is not configured")
+        return False
+
+    try:
+        response = requests.post(
+            MEMORY_URL,
+            headers={
+                **memory_headers(),
+                "Prefer": "return=minimal",
+            },
+            json={
+                "owner_telegram_id": str(owner_id),
+                "memory_type": memory_type,
+                "content": content,
+            },
+            timeout=15,
+        )
+
+        if response.status_code not in (200, 201, 204):
+            app.logger.error(
+                "Supabase memory save failed: HTTP %s",
+                response.status_code,
+            )
+            return False
+
+        return True
 
     except requests.RequestException:
-        app.logger.exception("Gemini model lookup failed")
-
-        return jsonify({
-            "error": "Could not connect to Gemini"
-        }), 502
+        app.logger.exception("Could not save Jarvis memory")
+        return False
 
 
-# ==================================================
-# ASK GEMINI
-# ==================================================
-
-def ask_gemini(user_text):
+# Gemini
+def ask_gemini(user_text, history=None):
     if not GEMINI_API_KEY:
-        app.logger.error("GEMINI_API_KEY is missing")
-        return "Jarvis is not configured correctly. Please check the server settings."
+        return "Jarvis is not configured correctly. Please check server settings."
 
-    if not user_text or not user_text.strip():
-        return "Please send me a message."
+    contents = []
+
+    for item in history or []:
+        kind = item.get("memory_type", "")
+        content = item.get("content", "")
+
+        if not content:
+            continue
+
+        if kind == "user":
+            role = "user"
+        elif kind == "assistant":
+            role = "model"
+        else:
+            continue
+
+        # Gemini conversation history alternates user/model roles.
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + content
+        else:
+            contents.append({
+                "role": role,
+                "parts": [{"text": content}],
+            })
+
+    # Add the new message after the stored history.
+    if contents and contents[-1]["role"] == "user":
+        contents[-1]["parts"][0]["text"] += "\n" + user_text.strip()
+    else:
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text.strip()}],
+        })
 
     payload = {
         "system_instruction": {
-            "parts": [
-                {
-                    "text": (
-                        "You are Jarvis, a helpful personal AI assistant. "
-                        "Respond clearly and naturally. "
-                        "Use the language of the user's message unless "
-                        "the user requests another language."
-                    )
-                }
-            ]
+            "parts": [{
+                "text": (
+                    "You are Jarvis, a helpful personal AI assistant. "
+                    "Respond clearly and naturally. Use the language "
+                    "of the user's message unless asked otherwise. "
+                    "The conversation history is provided for context."
+                )
+            }]
         },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": user_text.strip()
-                    }
-                ]
-            }
-        ],
+        "contents": contents,
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 2048
-        }
+            "maxOutputTokens": 2048,
+        },
     }
 
     retryable_statuses = {429, 500, 502, 503, 504}
-    max_attempts = 3
 
-    for attempt in range(max_attempts):
+    for attempt in range(3):
         try:
             response = requests.post(
                 GEMINI_API,
                 headers={
                     "x-goog-api-key": GEMINI_API_KEY,
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=60
+                timeout=60,
             )
 
             if response.status_code == 200:
                 data = response.json()
-
                 candidates = data.get("candidates", [])
 
                 if candidates:
@@ -190,7 +218,6 @@ def ask_gemini(user_text):
                         .get("content", {})
                         .get("parts", [])
                     )
-
                     answer = "".join(
                         part.get("text", "")
                         for part in parts
@@ -200,76 +227,46 @@ def ask_gemini(user_text):
                     if answer:
                         return answer
 
-                app.logger.warning(
-                    "Gemini returned no usable text"
-                )
                 return "I received an empty response. Please try again."
 
             if response.status_code in retryable_statuses:
                 app.logger.warning(
-                    "Gemini temporary error: HTTP %s; attempt %s/%s",
+                    "Gemini temporary error: HTTP %s, attempt %s/3",
                     response.status_code,
                     attempt + 1,
-                    max_attempts
                 )
-
-                if attempt < max_attempts - 1:
+                if attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
 
-                return (
-                    "Gemini is temporarily unavailable or busy. "
-                    "Please try again in a little while."
-                )
+                return "Gemini is temporarily busy. Please try again shortly."
 
             app.logger.error(
-                "Gemini request failed with HTTP %s",
-                response.status_code
+                "Gemini request failed: HTTP %s",
+                response.status_code,
             )
+            return "I couldn't process that request. Please try again later."
 
-            return (
-                "I couldn't process that request. "
-                "Please try again later."
-            )
-
-        except requests.RequestException:
-            app.logger.exception(
-                "Gemini connection error; attempt %s/%s",
-                attempt + 1,
-                max_attempts
-            )
-
-            if attempt < max_attempts - 1:
+        except (requests.RequestException, ValueError):
+            app.logger.exception("Gemini request error")
+            if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
 
-            return (
-                "I couldn't connect to Gemini. "
-                "Please try again in a little while."
-            )
-
-        except ValueError:
-            app.logger.exception("Invalid Gemini response")
-            return "I received an invalid response. Please try again."
+            return "I couldn't connect to Gemini. Please try again shortly."
 
     return "Something went wrong. Please try again."
 
 
-# ==================================================
-# SEND TELEGRAM MESSAGE
-# ==================================================
-
+# Telegram message sender
 def send_message(chat_id, text):
     if not TOKEN:
         app.logger.error("TELEGRAM_BOT_TOKEN is missing")
         return False
 
-    # Telegram messages have a length limit.
-    max_length = 4000
-
     chunks = [
-        text[i:i + max_length]
-        for i in range(0, len(text), max_length)
+        text[i:i + 4000]
+        for i in range(0, len(text), 4000)
     ] or [""]
 
     all_sent = True
@@ -278,152 +275,132 @@ def send_message(chat_id, text):
         try:
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": chunk
-                },
-                timeout=20
+                json={"chat_id": chat_id, "text": chunk},
+                timeout=20,
             )
 
             if not response.ok:
                 app.logger.error(
                     "Telegram sendMessage failed: HTTP %s",
-                    response.status_code
+                    response.status_code,
                 )
                 all_sent = False
 
         except requests.RequestException:
-            app.logger.exception(
-                "Could not send Telegram message"
-            )
+            app.logger.exception("Telegram send error")
             all_sent = False
 
     return all_sent
 
 
-# ==================================================
-# SET TELEGRAM WEBHOOK
-# Requires X-Setup-Secret header
-# ==================================================
+# Check Gemini models (protected)
+@app.route("/check-models", methods=["GET"])
+@require_setup_secret
+def check_models():
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
 
+    try:
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return jsonify({"error": "Gemini model lookup failed"}), 502
+
+        models = [
+            model["name"]
+            for model in response.json().get("models", [])
+            if model.get("name")
+        ]
+        return jsonify({"models": models})
+
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Gemini model lookup error")
+        return jsonify({"error": "Could not check Gemini models"}), 502
+
+
+# Configure Telegram webhook (protected)
 @app.route("/set-webhook", methods=["GET"])
 @require_setup_secret
 def set_webhook():
-    if not TOKEN:
-        return jsonify({
-            "error": "TELEGRAM_BOT_TOKEN is not configured"
-        }), 500
-
     render_url = os.environ.get(
         "RENDER_EXTERNAL_URL", ""
     ).strip().rstrip("/")
 
-    if not render_url:
-        return jsonify({
-            "error": "RENDER_EXTERNAL_URL is not configured"
-        }), 500
-
-    webhook_url = f"{render_url}/telegram-webhook"
+    if not TOKEN or not render_url:
+        return jsonify({"error": "Bot token or Render URL is missing"}), 500
 
     try:
         response = requests.post(
             f"{TELEGRAM_API}/setWebhook",
-            json={
-                "url": webhook_url
-            },
-            timeout=20
+            json={"url": f"{render_url}/telegram-webhook"},
+            timeout=20,
         )
 
-        try:
-            data = response.json()
-        except ValueError:
-            data = {}
+        data = response.json()
 
         if response.ok and data.get("ok"):
             return jsonify({
                 "ok": True,
-                "message": "Webhook configured successfully"
+                "message": "Webhook configured successfully",
             })
 
-        app.logger.error(
-            "Telegram webhook setup failed: HTTP %s",
-            response.status_code
-        )
+        return jsonify({"error": "Telegram webhook setup failed"}), 502
 
-        return jsonify({
-            "error": "Telegram webhook setup failed"
-        }), 502
-
-    except requests.RequestException:
-        app.logger.exception("Webhook setup connection error")
-
-        return jsonify({
-            "error": "Could not connect to Telegram"
-        }), 502
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Webhook setup error")
+        return jsonify({"error": "Could not configure webhook"}), 502
 
 
-# ==================================================
-# TELEGRAM WEBHOOK
-# OWNER-ONLY PRIVATE ACCESS
-# ==================================================
-
+# Telegram webhook: owner-only private access
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
-
     message = update.get("message", {})
 
-    # Ignore updates without a normal message.
     if not message:
         return jsonify({"ok": True})
 
     chat = message.get("chat", {})
     sender = message.get("from", {})
-
     chat_id = chat.get("id")
     user_id = str(sender.get("id", ""))
     user_text = message.get("text", "")
 
-    # Allow only the configured owner in a private chat.
     if (
         chat.get("type") != "private"
         or not OWNER_TELEGRAM_ID
         or user_id != OWNER_TELEGRAM_ID
     ):
-        app.logger.warning(
-            "Ignored unauthorized Telegram message"
-        )
+        app.logger.warning("Ignored unauthorized Telegram message")
         return jsonify({"ok": True})
 
     if not chat_id or not user_text:
         return jsonify({"ok": True})
 
-    # Start command.
     if user_text.strip().split()[0].split("@")[0] == "/start":
         send_message(
             chat_id,
-            (
-                "Hello! I'm Jarvis, your personal AI assistant. "
-                "How can I help you?"
-            )
+            "Hello! I'm Jarvis, your personal AI assistant. How can I help?",
         )
         return jsonify({"ok": True})
 
-    # Ask Gemini.
-    answer = ask_gemini(user_text)
-    send_message(chat_id, answer)
+    # Read earlier history before saving this new message.
+    history = get_recent_memory(OWNER_TELEGRAM_ID, limit=10)
 
+    answer = ask_gemini(user_text, history)
+
+    # Keep the bot responsive even if Supabase is temporarily unavailable.
+    save_memory(OWNER_TELEGRAM_ID, "user", user_text.strip())
+    save_memory(OWNER_TELEGRAM_ID, "assistant", answer)
+
+    send_message(chat_id, answer)
     return jsonify({"ok": True})
 
 
-# ==================================================
-# START SERVER
-# ==================================================
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
